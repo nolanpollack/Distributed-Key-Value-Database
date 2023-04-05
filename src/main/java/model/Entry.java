@@ -1,8 +1,15 @@
 package model;
 
+import java.util.Optional;
+
 public class Entry {
+    public enum Type {
+        GET,
+        PUT
+    }
+    private final Type type;
     private final String key;
-    private final String value;
+    private final Optional<String> value;
     private final int term;
 
     public String getKey() {
@@ -10,16 +17,30 @@ public class Entry {
     }
 
     public String getValue() {
-        return value;
+        return value.orElse(null);
     }
 
     public int getTerm() {
         return term;
     }
 
+    /**
+     * Constructor for PUT
+     * @param key
+     * @param value
+     * @param term
+     */
     public Entry(String key, String value, int term) {
+        this.type = Type.PUT;
         this.key = key;
-        this.value = value;
+        this.value = Optional.of(value);
+        this.term = term;
+    }
+
+    public Entry (String key, int term) {
+        this.type = Type.GET;
+        this.key = key;
+        this.value = Optional.empty();
         this.term = term;
     }
 }
