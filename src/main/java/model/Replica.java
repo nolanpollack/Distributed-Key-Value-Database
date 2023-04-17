@@ -29,7 +29,7 @@ public class Replica {
 
     private int currentTerm;
     private String votedFor;
-    List<Entry> log;
+    List<PutEntry> log;
     private int commitIndex = 0;
     private int lastApplied = 0;
 
@@ -60,7 +60,7 @@ public class Replica {
         this.votedFor = null;
         this.leaderId = BROADCAST;
         this.log = new ArrayList<>();
-        log.add(new Entry("0", "0", 0));
+        log.add(new PutEntry("0", "0", 0, null));
         this.kvStore = new HashMap<>();
 
         try {
@@ -204,19 +204,25 @@ public class Replica {
             state = State.FOLLOWER;
             leaderId = msg.src;
             for (int i = 0; i < msg.entries.length; i++) {
-                Entry entry = msg.entries[i];
+                PutEntry putEntry = msg.entries[i];
                 if (log.size() <= msg.prevLogIndex + i + 1) {
-                    log.add(entry);
+                    log.add(putEntry);
                 } else {
-                    log.set(msg.prevLogIndex + i + 1, entry);
+                    log.set(msg.prevLogIndex + i + 1, putEntry);
                 }
-                send(new AppendEntriesResponseMessage(id, msg.src, leaderId, currentTerm, true, log.size() - 1, msg.MID));
+                send(new AppendEntriesResponseMessage(id, msg.src, leaderId, currentTerm, true, msg.MID));
                 if (msg.leaderCommit > commitIndex) {
                     commitIndex = Math.min(msg.prevLogIndex + i + 1, msg.leaderCommit);
+                    for (int j = lastApplied + 1; j <= commitIndex; j++) {
+                        PutEntry e = log.get(j);
+                        kvStore.put(e.getKey(), e.getValue());
+                    }
+//                    System.out.println("Last Commit Index: " + commitIndex + " Last Commit: " + log.get(commitIndex).getKey());
+                    lastApplied = commitIndex;
                 }
             }
         } else {
-            send(new AppendEntriesResponseMessage(id, msg.src, leaderId, currentTerm, false, log.size() - 1, msg.MID));
+            send(new AppendEntriesResponseMessage(id, msg.src, leaderId, currentTerm, false, msg.MID));
         }
     }
 
@@ -264,10 +270,13 @@ public class Replica {
             state = State.FOLLOWER;
             votedFor = null;
         }
-        if (message.term < currentTerm) {
+        if (message.term < currentTerm ||
+                message.lastLogTerm < log.get(log.size() - 1).getTerm() ||
+                message.lastLogTerm == log.get(log.size() - 1).getTerm() && message.lastLogIndex < log.size() - 1) {
             send(new VoteMessage(id, message.src, leaderId, message.MID, currentTerm, false));
             return;
         }
+
         if (votedFor == null || votedFor.equals(message.src)) {
             send(new VoteMessage(id, message.src, leaderId, message.MID, currentTerm, true));
             votedFor = message.src;
@@ -382,7 +391,7 @@ public class Replica {
                 handleRequestVote((RequestVoteMessage) message);
                 break;
             case "appendEntriesResponse":
-                handleAppendEntriesResponse((AppendEntriesResponseMessage) message);
+                handleAppendEntriesResponse((AppendEntriesResponseMessage) message, nextIndex, matchIndex);
                 break;
             default:
                 System.out.println("Unknown message type: " + message.type);
@@ -392,6 +401,7 @@ public class Replica {
     private void get(GetMessage message) throws IOException {
         if (kvStore.containsKey(message.key)) {
             send(new OkMessage(id, message.src, message.leader, message.MID, kvStore.get(message.key)));
+//            System.out.println("Getting key: " + message.key + " value: " + kvStore.get(message.key));
         } else {
             send(new OkMessage(id, message.src, message.leader, message.MID, ""));
             System.out.println("Key not found: " + message.key);
@@ -399,45 +409,60 @@ public class Replica {
     }
 
     private void put(PutMessage message, Map<String, Integer> nextIndex, Map<String, Integer> matchIndex) throws IOException {
-        Entry entry = new Entry(message.key, message.value, currentTerm);
-        AppendEntriesMessage appendEntries = new AppendEntriesMessage(id, BROADCAST, leaderId, currentTerm, log.size() - 1, log.get(log.size() - 1).getTerm(), commitIndex, entry);
-        log.add(entry);
+        PutEntry putEntry = new PutEntry(message.key, message.value, currentTerm, message);
+        AppendEntriesMessage appendEntries = new AppendEntriesMessage(id, BROADCAST, leaderId, currentTerm, log.size() - 1, log.get(log.size() - 1).getTerm(), commitIndex, putEntry);
+        log.add(putEntry);
         send(appendEntries);
         lastSentHeartbeat = System.currentTimeMillis();
-        Queue<PutMessage> putQueue = new LinkedList<>();
-        int numReplicated = 0;
-        while (numReplicated != peers.length / 2) {
-            Message received = receive();
-            switch (received.type) {
-                case "appendEntriesResponse":
-                    AppendEntriesResponseMessage response = (AppendEntriesResponseMessage) received;
-                    if (response.lastLogIndex == log.size() - 1 && response.success) {
-                        numReplicated++;
-                        nextIndex.put(response.src, log.size());
-                        matchIndex.put(response.src, log.size() - 1);
-                    }
-                    break;
-                case "put":
-                    putQueue.add((PutMessage) received);
-                    break;
-                case "get":
-                    get((GetMessage) received);
-                    break;
-            }
-        }
-        kvStore.put(message.key, message.value);
-        send(new OkMessage(id, message.src, message.leader, message.MID));
-        lastApplied = log.size() - 1;
-        for (PutMessage m : putQueue) {
-            put(m, nextIndex, matchIndex);
-        }
     }
 
-    private void handleAppendEntriesResponse(AppendEntriesResponseMessage message) {
+    private void handleAppendEntriesResponse(AppendEntriesResponseMessage message, Map<String, Integer> nextIndex, Map<String, Integer> matchIndex) throws IOException {
         if (message.success) {
+            matchIndex.put(message.src, nextIndex.get(message.src));
+            nextIndex.put(message.src, nextIndex.get(message.src) + 1);
+
+            if (log.size() - 1 >= nextIndex.get(message.src)) {
+                send(new AppendEntriesMessage(id, message.src, leaderId, currentTerm, nextIndex.get(message.src) - 1, log.get(nextIndex.get(message.src) - 1).getTerm(), commitIndex, log.get(nextIndex.get(message.src))));
+            } else {
+                checkCommit(nextIndex, matchIndex);
+            }
 
         } else {
             //TODO
+        }
+    }
+
+    /**
+     * Check if any new entries have been replicated to a majority of the cluster, if so commit them.
+     * @param nextIndex
+     * @param matchIndex
+     */
+    private void checkCommit(Map<String, Integer> nextIndex, Map<String, Integer> matchIndex) throws IOException {
+        Map<Integer, Integer> numReplicated = new HashMap<>();
+        for (String server : matchIndex.keySet()) {
+            if (matchIndex.get(server) > commitIndex) {
+                for (int i = commitIndex + 1; i <= matchIndex.get(server); i++) {
+                    numReplicated.put(i, numReplicated.getOrDefault(i, 0) + 1);
+                }
+            }
+        }
+        //Check if any new entries have been replicated to a majority of the cluster
+        for (int i = commitIndex + 1; i < log.size(); i++) {
+            if (numReplicated.getOrDefault(i, 0) > peers.length / 2) {
+                int[] matchIndexArray = new int[5];
+                for (String server : matchIndex.keySet()) {
+                    matchIndexArray[Integer.parseInt(server)] = matchIndex.get(server);
+                }
+                System.out.println(Arrays.toString(matchIndexArray));
+
+                //Commit entry
+                System.out.println("Committing entry: " + i);
+                commitIndex = i;
+                kvStore.put(log.get(i).getKey(), log.get(i).getValue());
+                lastApplied = i;
+                PutMessage message = log.get(i).getMessage();
+                send(new OkMessage(id, message.src, leaderId, message.MID));
+            }
         }
     }
 
