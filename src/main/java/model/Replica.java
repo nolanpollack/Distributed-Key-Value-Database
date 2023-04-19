@@ -200,29 +200,31 @@ public class Replica {
             votedFor = null;
             leaderId = msg.src;
         }
+        if (msg.entries.length == 0) {
+            return;
+        }
         if (validAppendEntries(msg)) {
             state = State.FOLLOWER;
             leaderId = msg.src;
-            for (int i = 0; i < msg.entries.length; i++) {
-                PutEntry putEntry = msg.entries[i];
-                if (log.size() <= msg.prevLogIndex + i + 1) {
-                    log.add(putEntry);
-                } else {
-                    log.set(msg.prevLogIndex + i + 1, putEntry);
-                }
-                send(new AppendEntriesResponseMessage(id, msg.src, leaderId, currentTerm, true, msg.MID));
-                if (msg.leaderCommit > commitIndex) {
-                    commitIndex = Math.min(msg.prevLogIndex + i + 1, msg.leaderCommit);
-                    for (int j = lastApplied + 1; j <= commitIndex; j++) {
-                        PutEntry e = log.get(j);
-                        kvStore.put(e.getKey(), e.getValue());
-                    }
-//                    System.out.println("Last Commit Index: " + commitIndex + " Last Commit: " + log.get(commitIndex).getKey());
-                    lastApplied = commitIndex;
-                }
+            if (log.size() > msg.prevLogIndex + 1) {
+                System.out.println("Log size is " + log.size() + " but expected " + (msg.prevLogIndex + 1));
+                log.subList(msg.prevLogIndex + 1, log.size()).clear();
             }
+            log.addAll(Arrays.asList(msg.entries));
+//            System.out.println("Log size now: " + log.size());
+
+            if (msg.leaderCommit > commitIndex) {
+                commitIndex = Math.min(log.size() - 1, msg.leaderCommit);
+                for (int j = lastApplied + 1; j <= commitIndex; j++) {
+                    PutEntry e = log.get(j);
+                    kvStore.put(e.getKey(), e.getValue());
+                }
+                lastApplied = commitIndex;
+            }
+            send(new AppendEntriesResponseMessage(id, msg.src, leaderId, currentTerm, true, msg.MID, log.size() - 1));
+
         } else {
-            send(new AppendEntriesResponseMessage(id, msg.src, leaderId, currentTerm, false, msg.MID));
+            send(new AppendEntriesResponseMessage(id, msg.src, leaderId, currentTerm, false, msg.MID, msg.prevLogIndex + msg.entries.length));
         }
     }
 
@@ -239,6 +241,7 @@ public class Replica {
         if (msg.prevLogIndex > log.size() - 1) {
             return false;
         }
+
         return msg.prevLogIndex <= 0 || log.get(msg.prevLogIndex).getTerm() == msg.prevLogTerm;
     }
 
@@ -300,7 +303,7 @@ public class Replica {
      * @throws IOException if the election cannot be started.
      */
     private void startElection() throws IOException {
-        System.out.println("Timeout! Starting election for term " + currentTerm);
+//        System.out.println("Timeout! Starting election for term " + currentTerm);
         state = State.CANDIDATE;
         electionTimeout = random.nextInt(TIMEOUTMAX) + TIMEOUTMIN;
         currentTerm++;
@@ -310,16 +313,10 @@ public class Replica {
     }
 
     private void runLeader(Queue<Message> queuedEntries) throws IOException {
-        lastSentHeartbeat = System.currentTimeMillis();
         Map<String, Integer> nextIndex = initializeNextIndex();
         Map<String, Integer> matchIndex = initializeMatchIndex();
+        initializeLeader(queuedEntries, nextIndex, matchIndex);
 
-        while (!queuedEntries.isEmpty()) {
-            Message m = queuedEntries.poll();
-            handleMessageLeader(m, nextIndex, matchIndex);
-        }
-
-        send(new AppendEntriesMessage(id, BROADCAST, id, currentTerm, log.size() - 1, log.get(log.size() - 1).getTerm(), commitIndex));
         while (this.state == State.LEADER) {
             //Send Heartbeat
             if (System.currentTimeMillis() - lastSentHeartbeat > HEARTBEAT) {
@@ -329,6 +326,16 @@ public class Replica {
 
             Message received = receive();
             handleMessageLeader(received, nextIndex, matchIndex);
+        }
+    }
+
+    private void initializeLeader(Queue<Message> queuedEntries, Map<String, Integer> nextIndex, Map<String, Integer> matchIndex) throws IOException {
+        send(new AppendEntriesMessage(id, BROADCAST, id, currentTerm, log.size() - 1, log.get(log.size() - 1).getTerm(), commitIndex));
+        lastSentHeartbeat = System.currentTimeMillis();
+
+        while (!queuedEntries.isEmpty()) {
+            Message m = queuedEntries.poll();
+            handleMessageLeader(m, nextIndex, matchIndex);
         }
     }
 
@@ -383,7 +390,7 @@ public class Replica {
                 get((GetMessage) message);
                 break;
             case "put":
-                put((PutMessage) message, nextIndex, matchIndex);
+                put((PutMessage) message);
                 break;
             case "vote":
                 break;
@@ -401,14 +408,13 @@ public class Replica {
     private void get(GetMessage message) throws IOException {
         if (kvStore.containsKey(message.key)) {
             send(new OkMessage(id, message.src, message.leader, message.MID, kvStore.get(message.key)));
-//            System.out.println("Getting key: " + message.key + " value: " + kvStore.get(message.key));
         } else {
             send(new OkMessage(id, message.src, message.leader, message.MID, ""));
             System.out.println("Key not found: " + message.key);
         }
     }
 
-    private void put(PutMessage message, Map<String, Integer> nextIndex, Map<String, Integer> matchIndex) throws IOException {
+    private void put(PutMessage message) throws IOException {
         PutEntry putEntry = new PutEntry(message.key, message.value, currentTerm, message);
         AppendEntriesMessage appendEntries = new AppendEntriesMessage(id, BROADCAST, leaderId, currentTerm, log.size() - 1, log.get(log.size() - 1).getTerm(), commitIndex, putEntry);
         log.add(putEntry);
@@ -418,26 +424,62 @@ public class Replica {
 
     private void handleAppendEntriesResponse(AppendEntriesResponseMessage message, Map<String, Integer> nextIndex, Map<String, Integer> matchIndex) throws IOException {
         if (message.success) {
-            matchIndex.put(message.src, nextIndex.get(message.src));
-            nextIndex.put(message.src, nextIndex.get(message.src) + 1);
-
-            if (log.size() - 1 >= nextIndex.get(message.src)) {
-                send(new AppendEntriesMessage(id, message.src, leaderId, currentTerm, nextIndex.get(message.src) - 1, log.get(nextIndex.get(message.src) - 1).getTerm(), commitIndex, log.get(nextIndex.get(message.src))));
-            } else {
-                checkCommit(nextIndex, matchIndex);
-            }
-
+            handleAppendEntriesSuccess(message, nextIndex, matchIndex);
         } else {
-            //TODO
+            handleAppendEntriesFailure(message, nextIndex);
         }
+    }
+
+    private void handleAppendEntriesSuccess(AppendEntriesResponseMessage message, Map<String, Integer> nextIndex, Map<String, Integer> matchIndex) throws IOException {
+        matchIndex.put(message.src, message.index);
+        nextIndex.put(message.src, message.index + 1);
+//        System.out.println("Success for " + message.src + " on message " + message.index);
+
+        if (log.size() - 1 >= nextIndex.get(message.src)) {
+//            System.out.println("Resending ");
+//            send(new AppendEntriesMessage(id, message.src, leaderId, currentTerm, nextIndex.get(message.src) - 1, log.get(nextIndex.get(message.src) - 1).getTerm(), commitIndex, log.get(nextIndex.get(message.src))));
+        } else {
+            checkCommit(matchIndex);
+        }
+    }
+
+    private void handleAppendEntriesFailure(AppendEntriesResponseMessage message, Map<String, Integer> nextIndex) throws IOException {
+//        System.out.println("Fail");
+        if (nextIndex.get(message.src) > 1) {
+            nextIndex.put(message.src, nextIndex.get(message.src) - 1);
+            PutEntry[] entries = getEntries(nextIndex.get(message.src));
+
+            send(new AppendEntriesMessage(id, message.src, leaderId, currentTerm, nextIndex.get(message.src) - 1, log.get(nextIndex.get(message.src) - 1).getTerm(), commitIndex, entries));
+        } else {
+            send(new AppendEntriesMessage(id, message.src, leaderId, currentTerm, 0, 0, commitIndex, log.get(1)));
+        }
+    }
+
+    private PutEntry[] getEntries(int nextIndex) {
+        PutEntry[] entries = new PutEntry[log.size() - nextIndex];
+        for (int i = nextIndex; i < log.size(); i++) {
+            entries[i - nextIndex] = log.get(i);
+        }
+        return entries;
     }
 
     /**
      * Check if any new entries have been replicated to a majority of the cluster, if so commit them.
-     * @param nextIndex
-     * @param matchIndex
+     *
+     * @param matchIndex the matchIndex map.
      */
-    private void checkCommit(Map<String, Integer> nextIndex, Map<String, Integer> matchIndex) throws IOException {
+    private void checkCommit(Map<String, Integer> matchIndex) throws IOException {
+        Map<Integer, Integer> numReplicated = numReplicatedPerIndex(matchIndex);
+
+        //Check if any new entries have been replicated to a majority of the cluster
+        for (int i = commitIndex + 1; i < log.size(); i++) {
+            if (log.get(i).getTerm() == currentTerm && numReplicated.getOrDefault(i, 0) + 1 > peers.length / 2) {
+                commitEntry(i);
+            }
+        }
+    }
+
+    private Map<Integer, Integer> numReplicatedPerIndex(Map<String, Integer> matchIndex) {
         Map<Integer, Integer> numReplicated = new HashMap<>();
         for (String server : matchIndex.keySet()) {
             if (matchIndex.get(server) > commitIndex) {
@@ -446,24 +488,17 @@ public class Replica {
                 }
             }
         }
-        //Check if any new entries have been replicated to a majority of the cluster
-        for (int i = commitIndex + 1; i < log.size(); i++) {
-            if (numReplicated.getOrDefault(i, 0) > peers.length / 2) {
-                int[] matchIndexArray = new int[5];
-                for (String server : matchIndex.keySet()) {
-                    matchIndexArray[Integer.parseInt(server)] = matchIndex.get(server);
-                }
-                System.out.println(Arrays.toString(matchIndexArray));
+        return numReplicated;
+    }
 
-                //Commit entry
-                System.out.println("Committing entry: " + i);
-                commitIndex = i;
-                kvStore.put(log.get(i).getKey(), log.get(i).getValue());
-                lastApplied = i;
-                PutMessage message = log.get(i).getMessage();
-                send(new OkMessage(id, message.src, leaderId, message.MID));
-            }
+    private void commitEntry(int index) throws IOException {
+        for (int i = commitIndex + 1; i <= index; i++) {
+            kvStore.put(log.get(i).getKey(), log.get(i).getValue());
         }
+        commitIndex = index;
+        lastApplied = index;
+        PutMessage message = log.get(index).getMessage();
+        send(new OkMessage(id, message.src, leaderId, message.MID));
     }
 
     public static void main(String[] args) {
