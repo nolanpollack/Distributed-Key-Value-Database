@@ -2,6 +2,7 @@ package model;
 
 import messages.PutMessage;
 
+// Represents a PUT entry in the log
 public class PutEntry {
     private final String key;
     private final String value;

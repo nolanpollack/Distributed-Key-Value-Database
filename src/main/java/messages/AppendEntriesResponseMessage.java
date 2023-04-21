@@ -4,6 +4,7 @@ public class AppendEntriesResponseMessage extends Message{
     public int term;
     public boolean success;
     public int index;
+    // If success is false, these fields are used to indicate the first index of the conflicting term
     public int conflictTerm;
     public int conflictTermFirstIndex;
 
