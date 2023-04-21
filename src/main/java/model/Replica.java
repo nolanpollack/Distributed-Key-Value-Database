@@ -16,8 +16,11 @@ public class Replica {
     }
 
     private final String BROADCAST = "FFFF";
+    // Minimum timeout in milliseconds
     private final int TIMEOUTMIN = 150;
+    // Maximum timeout in milliseconds
     private final int TIMEOUTMAX = 300;
+    // Frequency of heartbeats in milliseconds
     private final int HEARTBEAT = 100;
 
     private final int port;
@@ -55,7 +58,7 @@ public class Replica {
         this.state = State.FOLLOWER;
         this.lastHeartbeat = System.currentTimeMillis();
         this.random = new Random();
-        this.electionTimeout = random.nextInt(TIMEOUTMAX) + TIMEOUTMIN;
+        this.electionTimeout = random.nextInt(TIMEOUTMAX - TIMEOUTMIN) + TIMEOUTMIN;
         this.currentTerm = 0;
         this.votedFor = null;
         this.leaderId = BROADCAST;
@@ -97,7 +100,6 @@ public class Replica {
                 message.getBytes().length,
                 new InetSocketAddress("localhost", port));
         this.socket.send(packet);
-//        System.out.println("Sent " + new String(packet.getData()));
     }
 
     /**
@@ -125,10 +127,12 @@ public class Replica {
         int numVotes = 1;
         int requiredVotes = peers.length / 2 + 1;
         Queue<Message> entryQueue = new LinkedList<>();
+        System.out.println("Starting election for term " + currentTerm);
         while (this.state == State.CANDIDATE) {
             if (electionTimeout()) {
                 startElection();
-                return;
+                numVotes = 1; // reset votes
+                System.out.println("Starting election for term " + currentTerm);
             }
             Message received = receive();
             switch (received.type) {
@@ -140,10 +144,13 @@ public class Replica {
                     break;
                 case "put":
                 case "get":
+                case "appendEntriesResponse":
                     entryQueue.add(received);
                     break;
                 case "requestVote":
                     handleRequestVote((RequestVoteMessage) received);
+                    break;
+                default:
             }
         }
         if (state.equals(State.LEADER)) {
@@ -167,7 +174,7 @@ public class Replica {
             state = State.FOLLOWER;
             votedFor = null;
             return 0;
-        } else if (msg.voteGranted) {
+        } else if (msg.voteGranted && msg.term == currentTerm) {
             if (numVotes + 1 >= requiredVotes) {
                 System.out.println("Elected as leader for term " + currentTerm);
                 state = State.LEADER;
@@ -207,14 +214,12 @@ public class Replica {
             state = State.FOLLOWER;
             leaderId = msg.src;
             if (log.size() > msg.prevLogIndex + 1) {
-                System.out.println("Log size is " + log.size() + " but expected " + (msg.prevLogIndex + 1));
                 log.subList(msg.prevLogIndex + 1, log.size()).clear();
             }
             log.addAll(Arrays.asList(msg.entries));
-//            System.out.println("Log size now: " + log.size());
 
             if (msg.leaderCommit > commitIndex) {
-                commitIndex = Math.min(log.size() - 1, msg.leaderCommit);
+                commitIndex = Math.min(Math.max(commitIndex, log.size() -1), msg.leaderCommit);
                 for (int j = lastApplied + 1; j <= commitIndex; j++) {
                     PutEntry e = log.get(j);
                     kvStore.put(e.getKey(), e.getValue());
@@ -224,8 +229,30 @@ public class Replica {
             send(new AppendEntriesResponseMessage(id, msg.src, leaderId, currentTerm, true, msg.MID, log.size() - 1));
 
         } else {
-            send(new AppendEntriesResponseMessage(id, msg.src, leaderId, currentTerm, false, msg.MID, msg.prevLogIndex + msg.entries.length));
+            int conflictingTerm = msg.entries[0].getTerm();
+            if (currentTerm < msg.prevLogTerm) {
+                conflictingTerm = currentTerm;
+            } else if (msg.prevLogIndex >= log.size()) {
+                conflictingTerm = log.get(log.size() - 1).getTerm();
+            } else if (log.get(msg.prevLogIndex).getTerm() != msg.prevLogTerm) {
+                conflictingTerm = log.get(msg.prevLogIndex).getTerm();
+            }
+
+            int firstWithTerm = firstWithTerm(conflictingTerm);
+            send(new AppendEntriesResponseMessage(id, msg.src, leaderId, currentTerm, false, msg.MID, msg.prevLogIndex + msg.entries.length, conflictingTerm, firstWithTerm));
         }
+    }
+
+    private int firstWithTerm(int term) {
+        int firstWithTerm = log.size();
+        for (int i = log.size() - 1; i >= 0; i--) {
+            if (log.get(i).getTerm() == term) {
+                firstWithTerm = i;
+            } else if (log.get(i).getTerm() < term) {
+                break;
+            }
+        }
+        return firstWithTerm;
     }
 
     /**
@@ -257,6 +284,7 @@ public class Replica {
             case "get":
                 send(new RedirectMessage(id, received.src, leaderId, received.MID));
                 break;
+            default:
         }
     }
 
@@ -275,7 +303,7 @@ public class Replica {
         }
         if (message.term < currentTerm ||
                 message.lastLogTerm < log.get(log.size() - 1).getTerm() ||
-                message.lastLogTerm == log.get(log.size() - 1).getTerm() && message.lastLogIndex < log.size() - 1) {
+                ((message.lastLogTerm == log.get(log.size() - 1).getTerm()) && message.lastLogIndex < log.size() - 1)) {
             send(new VoteMessage(id, message.src, leaderId, message.MID, currentTerm, false));
             return;
         }
@@ -303,9 +331,8 @@ public class Replica {
      * @throws IOException if the election cannot be started.
      */
     private void startElection() throws IOException {
-//        System.out.println("Timeout! Starting election for term " + currentTerm);
         state = State.CANDIDATE;
-        electionTimeout = random.nextInt(TIMEOUTMAX) + TIMEOUTMIN;
+        electionTimeout = random.nextInt(TIMEOUTMAX - TIMEOUTMIN) + TIMEOUTMIN;
         currentTerm++;
         votedFor = id;
         lastHeartbeat = System.currentTimeMillis();
@@ -400,8 +427,21 @@ public class Replica {
             case "appendEntriesResponse":
                 handleAppendEntriesResponse((AppendEntriesResponseMessage) message, nextIndex, matchIndex);
                 break;
+            case "appendEntries":
+                handleAppendEntriesLeader((AppendEntriesMessage) message);
+                break;
             default:
                 System.out.println("Unknown message type: " + message.type);
+        }
+    }
+
+    private void handleAppendEntriesLeader(AppendEntriesMessage msg) throws IOException {
+        if (msg.term > currentTerm) {
+            currentTerm = msg.term;
+            state = State.FOLLOWER;
+            votedFor = null;
+        } else {
+            send(new AppendEntriesResponseMessage(id, msg.src, msg.leader, currentTerm, false, msg.MID, msg.prevLogIndex + msg.entries.length));
         }
     }
 
@@ -417,8 +457,8 @@ public class Replica {
     private void put(PutMessage message) throws IOException {
         PutEntry putEntry = new PutEntry(message.key, message.value, currentTerm, message);
         AppendEntriesMessage appendEntries = new AppendEntriesMessage(id, BROADCAST, leaderId, currentTerm, log.size() - 1, log.get(log.size() - 1).getTerm(), commitIndex, putEntry);
-        log.add(putEntry);
         send(appendEntries);
+        log.add(putEntry);
         lastSentHeartbeat = System.currentTimeMillis();
     }
 
@@ -433,20 +473,34 @@ public class Replica {
     private void handleAppendEntriesSuccess(AppendEntriesResponseMessage message, Map<String, Integer> nextIndex, Map<String, Integer> matchIndex) throws IOException {
         matchIndex.put(message.src, message.index);
         nextIndex.put(message.src, message.index + 1);
-//        System.out.println("Success for " + message.src + " on message " + message.index);
 
-        if (log.size() - 1 >= nextIndex.get(message.src)) {
-//            System.out.println("Resending ");
-//            send(new AppendEntriesMessage(id, message.src, leaderId, currentTerm, nextIndex.get(message.src) - 1, log.get(nextIndex.get(message.src) - 1).getTerm(), commitIndex, log.get(nextIndex.get(message.src))));
-        } else {
+        if (log.size() - 1 < nextIndex.get(message.src)) {
             checkCommit(matchIndex);
         }
     }
 
     private void handleAppendEntriesFailure(AppendEntriesResponseMessage message, Map<String, Integer> nextIndex) throws IOException {
-//        System.out.println("Fail");
+        if (message.term > currentTerm) {
+            currentTerm = message.term;
+            state = State.FOLLOWER;
+            lastHeartbeat = System.currentTimeMillis();
+            electionTimeout = random.nextInt(TIMEOUTMAX - TIMEOUTMIN) + TIMEOUTMIN;
+            return;
+        }
         if (nextIndex.get(message.src) > 1) {
-            nextIndex.put(message.src, nextIndex.get(message.src) - 1);
+            if (message.conflictTermFirstIndex > log.size() - 1) {
+                nextIndex.put(message.src, log.size() - 1);
+            }
+            else if (message.conflictTermFirstIndex > 1) {
+                if (log.get(message.conflictTermFirstIndex).getTerm() == message.conflictTerm) {
+                    nextIndex.put(message.src, message.conflictTermFirstIndex);
+                } else {
+                    nextIndex.put(message.src, message.conflictTermFirstIndex - 1);
+                }
+            } else {
+                nextIndex.put(message.src, 1);
+            }
+//            nextIndex.put(message.src, message.conflictTermFirstIndex);
             PutEntry[] entries = getEntries(nextIndex.get(message.src));
 
             send(new AppendEntriesMessage(id, message.src, leaderId, currentTerm, nextIndex.get(message.src) - 1, log.get(nextIndex.get(message.src) - 1).getTerm(), commitIndex, entries));
@@ -457,8 +511,9 @@ public class Replica {
 
     private PutEntry[] getEntries(int nextIndex) {
         PutEntry[] entries = new PutEntry[log.size() - nextIndex];
-        for (int i = nextIndex; i < log.size(); i++) {
-            entries[i - nextIndex] = log.get(i);
+        for (int i = nextIndex; i < Math.min(log.size(), nextIndex + 100); i++) {
+            PutEntry entry = log.get(i);
+            entries[i - nextIndex] = entry;
         }
         return entries;
     }
@@ -473,7 +528,7 @@ public class Replica {
 
         //Check if any new entries have been replicated to a majority of the cluster
         for (int i = commitIndex + 1; i < log.size(); i++) {
-            if (log.get(i).getTerm() == currentTerm && numReplicated.getOrDefault(i, 0) + 1 > peers.length / 2) {
+            if (log.get(i).getTerm() == currentTerm && (numReplicated.getOrDefault(i, 0) + 1) > (peers.length / 2)) {
                 commitEntry(i);
             }
         }
@@ -490,15 +545,14 @@ public class Replica {
         }
         return numReplicated;
     }
-
     private void commitEntry(int index) throws IOException {
         for (int i = commitIndex + 1; i <= index; i++) {
             kvStore.put(log.get(i).getKey(), log.get(i).getValue());
+            PutMessage message = log.get(i).getMessage();
+            send(new OkMessage(id, message.src, leaderId, message.MID));
         }
         commitIndex = index;
         lastApplied = index;
-        PutMessage message = log.get(index).getMessage();
-        send(new OkMessage(id, message.src, leaderId, message.MID));
     }
 
     public static void main(String[] args) {
