@@ -2,7 +2,7 @@
 
 ## Description
 
-This is a distributed key-value database. It is an approximate implementation of the Raft consensur algorithm. 
+This is a distributed key-value database. It is an approximate implementation of the Raft consensus algorithm. 
 
 ## Usage
 
